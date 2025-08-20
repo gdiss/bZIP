@@ -1,0 +1,1651 @@
+---
+title: "Barcode variants association"
+author: "Guillaume Diss"
+date: "04/05/2022"
+output:
+  html_document:
+    code_folding: show
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+
+## Intro
+
+Barcode variant association using mutscan to load and merge reads, then splitting the read into its different regions.
+
+The reason why we try these way is because linkMultipleVariants can't collapse barcodes when they don't all have the same length. linkMultipleVariants also doesn't use information about shared variant when collapsing barcodes
+
+
+
+## Environnment
+
+Session
+
+```{r 001-setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+
+# number of threads
+mc = 48
+```
+
+Packages
+
+```{r 002-packages, hide=T}
+suppressPackageStartupMessages({
+  library(parallel)
+  library(ggplot2)
+  library(rgl)
+  library(stringdist)
+  library(mutscan)
+  library(Biostrings)
+  library(stringr)
+  library(data.table)
+})
+knitr::knit_hooks$set(webgl = hook_webgl)
+```
+
+Path to fastq files
+
+```{r}
+datapath = "000-data"
+
+samples <- dir(datapath)[grep("3047F",dir(datapath))]
+samples = file.path(datapath, samples[c(1:2,6,7)])
+
+```
+
+
+
+## Load
+
+Using mutscan only to load and merge reads.
+
+Reading and merging was already done in the preliminary analysis. We can just load it. Then, determining the correct phase of the different region can be done a little bit differently than last time
+
+```{r}
+
+raw = digestFastqs(     fastqForward = file.path(datapath, samples[c(1,3)]),
+                        fastqReverse = file.path(datapath, samples[c(2,4)]),
+                         mergeForwardReverse = T,
+                         maxFracMismatchOverlap = 0.03,
+                         revComplReverse = T,
+                         minOverlap = 85,
+                         maxOverlap = 132,
+                         elementsForward = "VS",
+                         elementLengthsForward = c(-1,1),
+                         elementsReverse = "VS",
+                         elementLengthsReverse = c(-1,1),
+                         verbose = FALSE, nThreads = mc,
+                         avePhredMinForward = 20,
+                         avePhredMinReverse = 20,
+                         maxNReads = -1
+)
+
+
+
+
+raw = raw$summaryTable[,c(2,5)]
+hist(nchar(raw[,1]))
+table(nchar(raw[,1]))
+
+save(raw, file="000-data/raw_bv_association.Rdata")
+
+
+```
+
+
+We don't pay attention at all to the KpnI site. Not important. If something is wrong there, something will be wrong somewhere else in the read anyway and filtered out later
+
+
+
+```{r}
+
+totReads = sum(raw$nbrReads)
+
+tmp = substr(raw$sequence, 1, 6)
+tmp = sum(raw$nbrReads[tmp == "GGTACC"])
+tmp / totReads
+
+```
+
+99.4% - we indeed don't need to filter out the others. At the beginning of the file, a lot of reads have a N in the second base, while the rest of the read is perfectly fine
+
+
+Let's use a different approach than before. Instead of first choping the read into its different regions, we only chop by NcoI, which delimit the barcode and the rest of the read. We then do the association between the barcode and the whole read, and only when the asosciation is properly done we can split the sequence into bait and prey variant. This will allow discarding true molecules that have a mutation in one of the restriction sites. We can anyway discard any read that doesn't have a perfect NcoI or SpeI match because these sites are essential for the subsequent cloning steps of all libraries. If there is a sequencing error in one of those sites, we don't care about keeping this read because the read without this error will be much more frequent. If there is an actual mutation, then this molecule is dead and won't make it through the subsequent cloning steps and the read can thus be safely discarded.
+
+
+```{r}
+
+# keep only reads with SpeI site
+raw$sequence = str_sub(raw$sequence, 7, -1)
+raw = raw[grepl("ACTAGT", raw$sequence, fixed=T),]
+sum(raw$nbrReads) / totReads
+
+# split read by NcoI site
+chopped = str_split_fixed(raw$sequence, "CCATGG", n=2)
+# keep only reads that were split by NcoI
+k = chopped[,2] != ""
+chopped = data.table(bc=chopped[k,1], va=chopped[k,2], nR = raw[k,2])
+sum(chopped$nR) / totReads
+
+chopped$nc_bc = nchar(chopped$bc)
+chopped$nc_va = nchar(chopped$va)
+
+rm(raw, k)
+```
+
+Only 5.6% of the reads don't have a NcoI or a SpeI site. About half of these are reads that don't have a NcoI site because it recombined with KpnI and thus was lost when removing the first 6bp
+
+
+
+
+
+```{r}
+
+tmp = chopped[, .(nR = sum(nR)), keyby='nc_bc']
+
+plot(nR~nc_bc,data=tmp,log="y",xlab="barcode length",ylab="counts")
+plot(nR/sum(nR)~nc_bc,data=tmp,log="y",xlab="barcode length",ylab="fraction")
+tmp[nc_bc==22,nR] / sum(tmp[,nR])
+tmp[nc_bc==21,nR] / sum(tmp[,nR])
+
+tmp = chopped[, .(nR = sum(nR)), keyby='nc_va']
+plot(nR~nc_va,data=tmp,log="y",xlab="variant length",ylab="counts")
+plot(nR/sum(nR)~nc_va,data=tmp,log="y",xlab="variant length",ylab="fraction")
+
+tmp = chopped[, .(nR = sum(nR)), keyby='nc_bc,nc_va']
+plot(nc_bc~nc_va,data=tmp,xlab="variant length",ylab="barcode length", col=heat.colors(40)[1:30][cut(log10(tmp$nR), breaks=31, include.lowest = T)], pch=16, cex=0.5)
+
+```
+
+Most of the barcodes are 22bp long. A decent percentage are 21bp long, but we can just ignore them because keeping the barcode length constant will making it faster and easier when analyzing the deepPCA data. These shouldn't interfere with the scoring because if they are really shorter, then the WT barcode will be out of phase and they will be filtered out (although it means that we can accept only a lv distance of maximum 1). But for now we should keep all reasonable barcode lengths, i.e. 20 to 23, the other ones having such a low frequency, and then figure later whether we want to keep them or not for the deepPCA
+
+84.5% of the variant side has 371bp, as expected, but 10.2% has 370bp, which seems high. In my opinion, these are probably deletion in runs of As in some bZ
+
+In some cases, the read is shorter because the first bp is missing. In other cases, there is clearly one bp missing in the coding sequence, and the variant with the deletion is the true variant
+
+Anyway, let's keep all variant lengths for now
+
+
+```{r}
+
+chopped = chopped[nc_bc >= 20 & nc_bc <= 23]
+
+unique_bar = chopped[,list(Nbc=sum(nR)), by='bc,nc_bc']
+unique_bar = unique_bar[order(-unique_bar$Nbc),]
+
+unique_var = chopped[,list(Nva=sum(nR)), by='va,nc_va']
+unique_var = unique_var[order(-unique_var$Nva),]
+
+bv = chopped[,list(Npair=sum(nR)), by='bc,va,nc_bc,nc_va']
+bv = bv[order(-bv$Npair),]
+
+# merge them to get the total number of reads for the barcode and variant of each pair
+# bv contains all pairs of barcodes and variants observed
+bv$Nbc = unique_bar$Nbc[match(bv$bc, unique_bar$bc)]
+bv$Nva = unique_var$Nva[match(bv$va, unique_var$va)]
+bv$Rbc = bv$Npair / bv$Nbc
+bv$Rva = bv$Npair / bv$Nva
+bv = bv[order(-bv$Npair),]
+
+rm(chopped)
+
+```
+
+
+
+
+```{r}
+hist(log10(unique_bar[,Nbc]),breaks=60)
+hist(log10(unique_bar[nc_bc==22,Nbc]),breaks=60)
+hist(log10(unique_bar[Nbc > 2,Nbc]),breaks=60) # to see better
+hist(log10(unique_bar[Nbc > 2 & nc_bc == 22,Nbc]),breaks=60) # to see better
+```
+
+peak at about 200. With about 800k expected barcodes, and 453e6 reads for 22bp barcodes, we can expect an average of 566 reads per barcode. Let's discard all reads with less than 5 bp as these are highly unlikely to be true barcodes or would anyway be at a too low frequency
+
+
+
+```{r}
+hist(log10(unique_var[,Nva]),breaks=60)
+hist(log10(unique_var[Nva > 5,Nva]),breaks=60)
+```
+
+Most of the unique variant sequences are sequencing errors and thus have low read count
+
+
+
+
+```{r}
+# keep only unique barcodes and their most abundant variant (since it has been order by decreasing read count)
+ubc = unique(bv,by='bc')
+
+k = ubc$Nbc >= 5
+plot(ubc$Rbc[k],ubc$Npair[k],xlab="fraction top variant", ylab="read count (bar-var pair)",pch=".", log="y")
+
+```
+
+heterogenous, most likely because of different sub-libraries
+
+
+### aggregate barcodes
+
+We first filter out all reads with less than 5 reads, and recalculate everything
+
+```{r}
+bv = bv[Npair >= 5,]
+
+unique_bar = bv[, .(Nbc = sum(Npair)), by='bc,nc_bc']
+unique_var = bv[, .(Nva = sum(Npair)), by='va,nc_va']
+unique_bar = unique_bar[order(-Nbc)]
+unique_var = unique_var[order(-Nva)]
+
+
+bv$Nbc = unique_bar$Nbc[match(bv$bc, unique_bar$bc)]
+bv$Nva = unique_var$Nva[match(bv$va, unique_var$va)]
+bv$Rbc = bv$Npair / bv$Nbc
+bv$Rva = bv$Npair / bv$Nva
+bv = bv[order(-Npair),]
+
+
+ubc = unique(bv,by='bc')
+plot(ubc$Rbc,ubc$Npair,xlab="fraction top variant", ylab="read count (bar-var pair)",pch=".", log="y")
+
+```
+
+We have about 965689 unique barcode sequences, which is close to the expected number. Some of these will still be collapsed
+
+
+
+## Collapse barcodes
+
+Let's now collapse similar barcodes
+
+```{r}
+
+va = split(ubc,ubc$va)
+
+# here we put aside the variants associated with a single barcode, since there's no need to collapse
+n = unlist(lapply(va,nrow))
+u = do.call("rbind",va[n==1])
+va = va[n>1]
+
+s = ceiling(seq(0,length(va),length.out=49))
+
+# then, for every variant
+uniq_ba = do.call("rbind",mclapply(1:(length(s)-1),function(i){
+  
+  tmp = va[(s[i]+1):s[i+1]]
+  do.call("rbind",lapply(1:length(tmp),function(x){
+
+    # get the barcodes 
+    cl = tmp[[x]]
+    
+    # measure the distance between the top one and all others
+    h = stringdist(cl$bc[1], cl$bc, method="lv", nthread = 1) # here we  can use lv confidently because they share the same variant (lv is less stringent than hamming because it also considers indels, while hamming would give indels a larger distance and they would thus be excluded)
+    
+    # remove all that are similar, except the top one that we keep
+    rel = cl[h <= 4,] # we use a distance of 4 for collapsing because it is highly unlikely that two true barcodes that close lend on the exact same variant
+    out = rel[1,]
+    
+    # repeat this by iterating through the remaining ones
+    others = cl[h > 4,]
+    i = 1
+    while(nrow(others)){
+      
+      h = stringdist(others$bc[1], others$bc, method="lv", nthread = 1)
+      rel = others[h <= 4,]
+      others = others[h > 4,]
+      
+      out = rbind(out, rel[1,])
+      
+      i = i+1
+    }
+    
+    out$Ava = i # number of barcodes associated with that variant
+    
+    out
+    
+  }))
+},mc.cores=48))
+
+
+u$Ava = 1
+uniq_ba = rbind(uniq_ba,u)
+
+# this is now a data.frame with only unique barcodes
+uniq_ba = uniq_ba[order(-uniq_ba$Nbc),]
+row.names(uniq_ba) = 1:nrow(uniq_ba)
+
+plot(uniq_ba$Nva, uniq_ba$Ava, xlab="total counts variant", ylab="total unique barcodes", log="xy", pch=".")
+
+hist(log10(uniq_ba$Npair),breaks=60)
+
+```
+
+We went from 965,689 to 885,846 barcodes
+
+
+
+We now have a list of true barcodes and their top associated variants. The unique set of variants from this list is considered the set of true variants. In case where a barcode is truly associated to two variants, the barcode will be filter-out and the variant won't be considered. Thus this set of unique variant is indeed the working set
+
+We probably still want to collapse similar variants that share the same barcode in order to identify these prmiscuous variants.
+
+## collapse variants
+
+```{r}
+bv2 = bv[bc %in% uniq_ba$bc]
+
+k = sample(nrow(bv2), 4e5)
+
+co = bv2$Rbc < 0.01 & bv2$Rva < 0.01
+
+plot3d(log10(bv2$Nbc[k]), log10(bv2$Nva[k]), log10(bv2$Npair[k]), xlab="bc", ylab="va",zlab="pair", size=1, col=co[k]+1)
+rglwidget(elementId = "plot3drgl1")
+```
+
+In past libraries, we could identify chimeras between barcodes and variants due to template switching easily because there was clear correlation to the total frequency of the corresponding barcode and variant, and they formed a cloud of point that was clearly separated from thos corresponding to true barcode-variant pairs.
+
+Here, it's a bit tricky to see where to put the threshold between chimeras and sequencing errors
+
+Let's first collapse clear sequencing errors, with a stringent distance for now (lv=4) and then make this plot again to see if we can see a clearer picture
+
+Chimeras can only form between variants of the same bZIP since PCRs were run for each of the 54 libraries independently.
+
+```{r}
+uva = split(bv2[Rbc < 1],bv2[Rbc < 1, bc])
+
+s = ceiling(seq(0,length(uva),length.out=49))
+
+# then, for every unique barcode
+uniq_pairs = do.call("rbind",mclapply(1:(length(s)-1),function(i){
+  
+  tmp = uva[(s[i]+1):s[i+1]]
+  do.call("rbind",lapply(1:length(tmp),function(x){
+
+    # get the variants 
+    cl = tmp[[x]]
+    
+    # measure the distance between the top one and all others
+    h = stringdist(cl$va[1], cl$va, method="lv", nthread = 1) # here we  can use lv confidently because they share the same barcode (lv is less stringent than hamming because it also considers indels, while hamming would give indels a larger distance and they would thus be excluded)
+    
+    # remove all that are similar, except the top one that we keep
+    rel = cl[h <= 4,] # we use a distance of 4 for collapsing because, despite that variants of the same bZ can differ by a single nt, it is highly unlikely that the exact same barcode is lends on two variants of the same bZIP since we have only ~700 variants per bZIP (expected) 
+    out = rel[1,]
+    
+    # repeat this by iterating through the remaining ones
+    others = cl[h > 4,]
+    i = 1
+    while(nrow(others)){
+      
+      h = stringdist(others$va[1], others$va, method="lv", nthread = 1)
+      rel = others[h <= 4,]
+      others = others[h > 4,]
+      
+      out = rbind(out, rel[1,])
+      
+      i = i+1
+    }
+    
+    out$Abc = i # number of variants associated with that barcode
+    
+    out
+    
+  }))
+},mc.cores=48))
+
+tmp = bv2[Rbc==1]
+tmp$Abc = 1
+
+uniq_pairs = rbind(uniq_pairs, tmp)
+uniq_pairs = uniq_pairs[order(-Npair)]
+
+unique_bar = uniq_pairs[, .(Nbc = sum(Npair)), by='bc']
+unique_var = uniq_pairs[, .(Nva = sum(Npair)), by='va']
+
+
+uniq_pairs$Nbc = unique_bar$Nbc[match(uniq_pairs$bc, unique_bar$bc)]
+uniq_pairs$Nva = unique_var$Nva[match(uniq_pairs$va, unique_var$va)]
+uniq_pairs$Rbc = uniq_pairs$Npair / uniq_pairs$Nbc
+uniq_pairs$Rva = uniq_pairs$Npair / uniq_pairs$Nva
+uniq_pairs = uniq_pairs[order(-Npair),]
+uniq_pairs$Ava = uniq_ba$Ava[match(uniq_pairs$bc, uniq_ba$bc)]
+
+
+plot(uniq_pairs$Rbc, uniq_pairs$Npair, log="y", pch=".", xlab="Rbc",ylab="Nbc")
+plot(uniq_pairs$Nbc, uniq_pairs$Abc, pch=".", log="xy", xlab="Nbc", ylab="No. variants per barcode")
+hist(uniq_pairs$Abc)
+
+```
+
+
+```{r}
+
+co = uniq_pairs$Rbc < 0.02 & uniq_pairs$Rva < 0.001
+
+plot3d(log10(uniq_pairs$Nbc), log10(uniq_pairs$Nva), log10(uniq_pairs$Npair), xlab="bc", ylab="va",zlab="pair", size=1, col=co+1)
+rglwidget(elementId = "plot3drgl2")
+
+```
+
+
+Let's keep them for now. The next step will be to identify the variant. We will then see if barcodes that are associated to several variant are associated to variant of the same bZ, in which case we will consider them as chimeras because it is so unlikely to happen
+
+Real barcode-variant chimeras are highly unlikely to happen during cloning because when we select ~20k transformant per bZIP, even if there are chimeras in the PCR rpoducts, at the moment of sub-sampling the 20k transformants, the likelihood of getting twice the same barcode is unlikely
+
+Looking at a few examples it is clear that the differences between the top variant of a barcode and the other variants correspond to several clusters of 1-3 mutations, i.e. chimeras between variants of the same bZIP that differ at some codons
+
+
+```{r}
+rm(u,ubc,uniq_ba,unique_bar,unique_var,uva,va,co,k,n,s,tmp,bv,bv2)
+save.image("tmp_image.Rdata")
+```
+
+
+## Chop variants sequence
+
+We don't care about mutations in the constant sequences, so we need to correctly phase the bait and prey coding sequences
+
+First, we split by SpeI, which we know is present everywhere since we checked for it earlier
+
+```{r}
+chop = str_split(uniq_pairs$va, "ACTAGT")
+# are there variants with more than one SpeI site?
+n = unlist(lapply(chop,length))
+table(n)
+```
+
+Some don't have it. These are likely cases where SpeI was found in the barcode actually
+
+```{r}
+tmp = uniq_pairs[n == 1,]
+sum(grepl("ACTAGT",tmp$bc)) / nrow(tmp)
+```
+
+They indeed all have it in the barcode and not at the correct place. These can then be filtered out as they won't make it to the final libraries
+
+Let's now check those that have three
+
+```{r}
+
+chop[n==3]
+
+uniq_pairs[n == 3,]
+```
+
+Some have the superfluous site in the bait, some in the prey CDS. They look like legit variants really present in the library. Those that have it in the bait sequence will end-up as truncated baits in both the homodimer and heterodimer libraries, but will be present and should thus be retained. In this case we want to retain the last fragment for further processing of the bait, and the first one for further processing of the prey. When the superfluous site is in the prey, the bait will be intact in heterodimer library, but the variant will be absent from the homodimer library because the middle fragment that contains the HindIII site will be lost. This will be revealed by further processing of the prey fragment in the next step.
+
+Thus, in both cases, we can just keep the first and last fragments for further processing
+
+```{r}
+# remove the central fragment that would be lost when digesting by SpeI
+chop[n==3] = lapply(chop[n==3],function(x){
+  x[c(1,3)]
+})
+
+# remove those without the SpeI site
+chop = chop[n != 1]
+uniq_pairs = uniq_pairs[n != 1,]
+
+# now all digested sequences have two fragments, and can thus be rbind
+chop = do.call("rbind", chop)
+
+# let's now check how many don't have the BamHI site that will be required for phasing the bait
+n = grepl("GGATCC",chop[,2])
+sum(!n)
+sum(!n) / nrow(chop)
+```
+
+848 don't have the BamHI site in the second fragment. This represents only 0.09%
+
+This could be a backbone mutation, but wouldn't really matter
+
+```{r}
+n2 = nchar(chop[!n,2])
+table(n2)
+```
+
+Expected size is 208, but many are shorter (only one is longer)
+
+After BamHI, there's 13 nt of L3. Those that are 194 or shorter could simply miss BamHI because the read is too short. Those that are 188 or shorter would not cover the whole bait CDS
+
+```{r}
+table(nchar(chop[!n,1][n2 <= 188]))
+```
+
+Expected size for for the first fragment is 157. Thus that have a too short second fragment is not due to a too long first fragment
+
+```{r}
+chop[!n,2][n2 <= 188]
+```
+
+Some seem to be truncated variants in the bait CDS because they have the primer site and a mutation in the BamHI site. Some others don't seem to have the primer site
+
+Let's first check how many we would salvage if we allow a single hamming distance with the BamHI site at the exact place where the BamHI site is expected, from the end
+
+```{r}
+tmp = stringdist("GGATCC",str_sub(chop[!n,2],-19,-14), method="hamming")
+table(tmp)
+table(tmp[n2==208])
+```
+
+439 have a single nt hamming distance with the BamHI site at its exact position, including all those that are the exact expected length. Let's salvage them, and mark the others are dubious
+
+```{r}
+chop2 = str_split(chop[,2], "GGATCC")
+# are there variants with more than one SpeI site?
+n = unlist(lapply(chop2,length))
+table(n)
+```
+
+A few also have an additional BamHI site. If these are true, the mutation must come from some of the backbone molecules because BamHI was never used to clone the pools, which were cloned in the DBD plasmids
+
+```{r}
+chop2[n==3]
+```
+
+They all correspond to BamHI sites inside the bait CDS. We can fix these by simply pasting back the two fragments with GGATCC
+
+```{r}
+chop2[n==3] = lapply(chop2[n==3],function(x){
+  c(paste0(x[1],"GGATCC",x[2]),x[3])
+})
+chop2[n==3]
+```
+
+
+Now let's fix the ones where the BamHI site is mutated and flag the others that didn't have a BamHI site as dubious
+
+```{r}
+chop2[n==1] = lapply(chop2[n==1],function(x){
+  
+  h = stringdist("GGATCC",str_sub(x,-19,-14), method="hamming")
+  if(h==1){
+    c(str_sub(x,1,-20), str_sub(x,-13,-1))
+  }else{
+    c(x,"dubious")
+  }
+  
+})
+chop2 = do.call("rbind",chop2)
+tmp = table(nchar(chop2[,1]))
+plot(as.numeric(names(tmp)),tmp,log="y",xlab="bait CDS length",ylab="No pairs")
+head(sort(tmp, decreasing=T))
+```
+
+Peak at 189 as expected, decent number have a 1nt deletion. Decent number also at 186, which is what is expected for CREB1 and ATF1
+
+
+
+Let's now split the first fragment with BsmBI and HindIII
+
+Here, we can ask for a perfect match since these sites are essential for the cloning of the homodimer and prey abundance libraries, while the whole of the first fragment is entirely removed when cloning the heterodimer and bait abundance libraries
+
+Unique pairs that don't have these sites can thus be flagged as probably not present in the homodimer and prey abundance libraries, but shouldn't be removed because hte corresponding bait will be present in the heterodimer library
+
+```{r}
+# we usually use the BsmBI site together with the A that follows. But the A is not recognized, so if it is mutated it wouldn't prevent cutting and the prey would be present in the library. Let's not check for it then, but we should remove the first base of the second fragment
+chop1_1 = str_split(chop[,1],"CGTCTC")
+n = unlist(lapply(chop1_1,length))
+table(n)
+
+```
+
+Not found in a few, found twice in some. In these, the last fragment would be the one to remain (the middle one would be lost), but only if the overhang is the same and compatible
+
+```{r}
+chop1_1[n==3] = lapply(chop1_1[n==3],function(x){
+  
+  if (substr(x[2],2,5) == substr(x[3],2,5)){
+    x[3] = str_sub(x[3],2,-1) # remove the first base
+    x[c(1,3)]
+  }else{
+    c("lost",x[3])
+  }
+ 
+})
+
+chop1_1[n==1] = lapply(chop1_1[n==1],function(x){
+  
+  c("lost",x)
+  
+})
+
+chop1_1[n==2] =  lapply(chop1_1[n==2],function(x){
+  
+  x[2] = str_sub(x[2],2,-1) # remove the first base
+  
+  x
+  
+})
+
+chop1_1 = do.call("rbind",chop1_1)
+
+```
+
+
+
+Now HindIII
+
+ATF1 and CREB1 variants should have a longer spacer between HindIII and SpeI, so this fragment should be 18bp instead of 12
+
+```{r}
+chop1_2 = str_split(chop1_1[,2],"AAGCTT")
+n = unlist(lapply(chop1_2,length))
+table(n)
+```
+
+Same as for BsmBI, those thant don't have it need to be flagged as lost, those that have 2 sites need to remove the middle fragment
+
+```{r}
+
+chop1_2[n==3] = lapply(chop1_2[n==3],function(x){
+  
+  x[c(1,3)]
+ 
+})
+
+chop1_2[n==1] = lapply(chop1_2[n==1],function(x){
+  
+  c(x,"lost")
+  
+})
+
+chop1_2 = do.call("rbind",chop1_2)
+
+tmp = table(nchar(chop1_2[,1]))
+plot(as.numeric(names(tmp)),tmp,log="y",xlab="prey CDS length",ylab="No pairs")
+head(sort(tmp, decreasing=T))
+
+tmp = table(nchar(chop1_2[,2]))
+plot(as.numeric(names(tmp)),tmp,log="y",xlab="cst2 length",ylab="No pairs")
+head(sort(tmp, decreasing=T))
+
+```
+Top one has 112nt as expected, second has 109 as expected for CREB1 and ATF1, next ones are negligible. Same for constant sequence 2 with 12 and 18 bp as expected
+
+
+
+```{r}
+
+va = data.table(
+  cst1 = chop1_1[,1],
+  prey = chop1_2[,1],
+  cst2 = chop1_2[,2],
+  bait = chop2[,1],
+  cst3 = chop2[,2]
+)
+va$preyFlag = va$cst1 == "lost" | va$cst2 == "lost"
+va$baitFlag = va$cst2 == "dubious"
+
+uniq_pairs = cbind(bc=uniq_pairs$bc,va,uniq_pairs[,2:ncol(uniq_pairs)])
+```
+
+
+
+## identify closest WT
+
+First, we need to format the expected sequences that where ordered as oligos
+
+Then, to speed up the matching (measuring the distance between these 900k sequence and 38k oligos would be way too long), we first determine which WT bZ these correspond to, and then we can determine which are the differences from WT, and whether they where expected
+
+
+```{r}
+twist = read.csv("000-data/TableS4_oligo_TWIST.txt")
+
+tmp = do.call("rbind",strsplit(twist$mutID,"_"))
+twist$gene = tmp[,1]
+twist$pool = tmp[,2]
+twist$id = tmp[,3]
+
+# reverse complement because the oligo was synthesized as the reverse strand
+twist$seq2 = as.character(reverseComplement(DNAStringSet(twist$sequence)))
+
+twist$var1 = substr(twist$seq2,28,139)
+twist$var1[twist$gene=="ATF1"] = substr(twist$seq2[twist$gene=="ATF1"],28,136)
+twist$var1[twist$gene=="CREB1"] = substr(twist$seq2[twist$gene=="CREB1"],28,136)
+twist$var2 = substr(twist$seq2,164,275)
+twist$var2[twist$gene=="ATF1"] = substr(twist$seq2[twist$gene=="ATF1"],167,275)
+twist$var2[twist$gene=="CREB1"] = substr(twist$seq2[twist$gene=="CREB1"],167,275)
+
+
+dbd = read.delim("000-data/TableS7_DBD_gBlock_sequences.txt")
+tmp = dbd$bZIP
+dbd = substr(dbd$seq,218,294)
+names(dbd) = tmp
+
+twist$var2 = paste0(twist$var2, dbd[twist$gene])
+twist_list = split(twist, twist$gene)
+
+wt_twist = twist[twist$id == "0xx",]
+
+```
+
+Now let's identify the closest WT
+
+```{r}
+
+# to speed up, we do it on unique bait and prey sequences and then match to all pairs
+
+ub = unique(uniq_pairs$bait[!uniq_pairs$baitFlag])
+up = unique(uniq_pairs$prey[!uniq_pairs$preyFlag])
+
+
+# get all distances
+h = do.call("cbind",mclapply(1:nrow(wt_twist),function(x){
+  stringdist(wt_twist$var1[x],up,method="lv",nthread = 1)
+},mc.cores=54))
+# keep only the indices of the two closest ones
+di = apply(h,1,order)[1:2,]
+# get the distances of the two closest ones
+di2 = t(sapply(1:ncol(di),function(x){
+  h[x,di[,x]]
+}))
+# get the id of the two closest ones
+di3 = t(sapply(1:ncol(di),function(x){
+  wt_twist$gene[di[,x]]
+}))
+
+up = data.table(prey=up, dist1.1 = di2[,1], dist1.2 = di2[,2], wt1.1 = di3[,1], wt1.2 = di3[,2])
+
+
+
+# get all distances
+h = do.call("cbind",mclapply(1:nrow(wt_twist),function(x){
+  stringdist(wt_twist$var2[x],ub,method="lv",nthread = 1)
+},mc.cores=54))
+# keep only the indices of the two closest ones
+di = apply(h,1,order)[1:2,]
+# get the distances of the two closest ones
+di2 = t(sapply(1:ncol(di),function(x){
+  h[x,di[,x]]
+}))
+# get the id of the two closest ones
+di3 = t(sapply(1:ncol(di),function(x){
+  wt_twist$gene[di[,x]]
+}))
+
+ub = data.table(bait=ub, dist2.1 = di2[,1], dist2.2 = di2[,2], wt2.1 = di3[,1], wt2.2 = di3[,2])
+```
+
+QC plots (is there ambiguity in the identification of the bZ)
+
+```{r}
+
+plot(up$dist1.1, up$dist1.2,xlab="lv distance to closest bZ", ylab="lv distance to second closest bZ",main="prey side")
+abline(0,1)
+plot(ub$dist2.1, ub$dist2.2,xlab="lv distance to closest bZ", ylab="lv distance to second closest bZ",main="bait side")
+abline(0,1)
+
+ggplot(up, aes(x=dist1.1, y=dist1.2) ) +
+  labs(x="lv distance to closest bZ", y="lv distance to second closest bZ", title="prey side") +
+  geom_bin2d(binwidth = 1, ) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw() + 
+  geom_abline(slope=1, intercept=0)
+
+ggplot(ub, aes(x=dist2.1, y=dist2.2) ) +
+  labs(x="lv distance to closest bZ", y="lv distance to second closest bZ", title="bait side") +
+  geom_bin2d(binwidth = 1) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw() + 
+  geom_abline(slope=1, intercept=0)
+```
+
+The call is never ambiguous. It can become ambiguous when the sequence is distant from even the closest bZ, i.e. it doesn't really correspond to anything
+
+Peaks at three mutations away from WT, but a decent number have 4 to 6 mutations, which shows that we have a high number of chimeras
+
+```{r}
+up$nc = nchar(up$prey)
+ub$nc = nchar(ub$bait)
+
+ggplot(up, aes(x=dist1.1, y=nc) ) +
+  labs(x="lv distance to closest bZ", y="prey length", title="prey side") +
+  geom_bin2d(binwidth = 1, ) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw()
+
+ggplot(ub, aes(x=dist2.1, y=nc) ) +
+  labs(x="lv distance to closest bZ", y="bait length", title="bait side") +
+  geom_bin2d(binwidth = 1) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw()
+
+```
+Those that have a large Levenstein distance are often truncated variants and in some cases longer variants
+
+Let's quickly check these baite that have the correct size but for which the closest bZ is rather distant
+
+```{r}
+tmp = ub[dist2.1 == 35 & nc == 189]
+head(tmp)
+h = stringdist(substr(tmp$bait[1],1,108),substr(wt_twist$var2,1,108))
+min(h)
+wt_twist$gene[which.min(h)]
+h = stringdist(str_sub(tmp$bait[1],109,-1),str_sub(wt_twist$var2,109,-1))
+min(h)
+wt_twist$gene[which.min(h)]
+
+str_sub(wt_twist$var2[wt_twist$gene=="XBP1"],109,112)
+str_sub(wt_twist$var2[wt_twist$gene=="JUND"],109,112)
+
+```
+This example is a chimera between a mutant of XBP1 leucine zipper domain and JUND DBD. They indeed have the same overhang sequence agter BsaI digestion. The clonings where done individually, but there is some contamination apparently
+
+It's actually cool to have a few of these, we can use them to test whether changing the DBD has an effect
+
+
+
+Let's actually identify the baits that are lz-dbd chimeras
+
+```{r}
+lz = str_sub(ub$bait,1,-82)
+dbd = str_sub(ub$bait,-81,-1)
+wt_lz = str_sub(wt_twist$var2,1,-82)
+wt_dbd = str_sub(wt_twist$var2,-81,-1)
+
+
+# get all distances
+h = do.call("cbind",mclapply(1:nrow(wt_twist),function(x){
+  stringdist(wt_lz[x],lz,method="lv",nthread = 1)
+},mc.cores=54))
+# keep only the indices of the two closest ones
+di = apply(h,1,order)[1:2,]
+# get the distances of the two closest ones
+di2 = t(sapply(1:ncol(di),function(x){
+  h[x,di[,x]]
+}))
+# get the id of the two closest ones
+di3 = t(sapply(1:ncol(di),function(x){
+  wt_twist$gene[di[,x]]
+}))
+
+lz2 = data.frame(di2,di3)
+
+# get all distances
+h = do.call("cbind",mclapply(1:nrow(wt_twist),function(x){
+  stringdist(wt_dbd[x],dbd,method="lv",nthread = 1)
+},mc.cores=54))
+# keep only the indices of the two closest ones
+di = apply(h,1,order)[1:2,]
+# get the distances of the two closest ones
+di2 = t(sapply(1:ncol(di),function(x){
+  h[x,di[,x]]
+}))
+# get the id of the two closest ones
+di3 = t(sapply(1:ncol(di),function(x){
+  wt_twist$gene[di[,x]]
+}))
+
+dbd2 = data.frame(di2,di3)
+
+
+nrow(dbd2[dbd2[,3] != lz2[,3],])
+nrow(dbd2[dbd2[,3] != lz2[,3],]) / nrow(dbd2)
+
+chimeras = cbind(dbd2[dbd2[,3] != lz2[,3],], lz2[dbd2[,3] != lz2[,3],])
+
+plot(chimeras[,1], chimeras[,5],xlab="distance to closest DBD", ylab="distance to closest LZ")
+
+chimeras = chimeras[chimeras[,1] < 10 & chimeras[,5] < 10,]
+nrow(chimeras)
+chimeras
+
+```
+
+Only 137 cases. Out of these some have their closest DBD or LZ that is too distant and thus likely a dubious sequence, e.g. a truncated variant
+
+116 are real chimeras though, with the DBD often WT and the LZ a mutant, as you would expect from the cloning strategy
+
+It is mostly JUND DBD and XBP1 LZ, and when it's not these two, most of the time the DBD has a few mutations (maybe in the overhang, which would explain it could be ligated)
+
+Let's flag these so that we can use them
+
+
+```{r}
+ub$dbd_lz_chimera = FALSE
+ub$dbd_lz_chimera[dbd2[,3] != lz2[,3] & dbd2[,1] < 10 & lz2[,1] < 10] = TRUE
+```
+
+
+
+Let's now check if all WT are there
+
+```{r}
+nrow(up[dist1.1==0])
+nrow(ub[dist2.1==0])
+```
+
+One WT bait is missing
+
+```{r}
+wt_twist$gene[!(wt_twist$gene %in% up$wt1.1[up$dist1.1==0])]
+wt_twist$gene[!(wt_twist$gene %in% ub$wt2.1[ub$dist2.1==0])]
+```
+
+ATF7 WT bait is missing. We know indeed from the preliminary analysis that a lot of ATF7 variants are missing. But at least ATF1 and CREB1 are here now
+
+
+Let's now see whether the bait and prey bZ correspond to each other in the majority of the cases. We first need to match these back to the bar-var association table
+
+Some won't match and thus will have NA in the dist and wt columns. These are the ones that where flagged before
+
+```{r}
+uniq_pairs = cbind(uniq_pairs,up[match(uniq_pairs$prey, up$prey),c("dist1.1","wt1.1","nc")])
+uniq_pairs = cbind(uniq_pairs,ub[match(uniq_pairs$bait, ub$bait),c("dist2.1","wt2.1","nc","dbd_lz_chimera")])
+
+names(uniq_pairs)[19:25] = c("dist_wt_prey","wt_prey","length_prey","dist_wt_bait","wt_bait","length_bait","dbd_lz_chimera_bait")
+
+# change the NAs because they could cause issues later
+uniq_pairs$dist_wt_prey[is.na(uniq_pairs$dist_wt_prey)] = 100
+uniq_pairs$dist_wt_bait[is.na(uniq_pairs$dist_wt_bait)] = 100
+uniq_pairs$length_prey[is.na(uniq_pairs$length_prey)] = 150
+uniq_pairs$length_bait[is.na(uniq_pairs$length_bait)] = 220
+uniq_pairs$wt_prey[is.na(uniq_pairs$wt_prey)] = "flagged"
+uniq_pairs$wt_bait[is.na(uniq_pairs$wt_bait)] = "flagged"
+uniq_pairs$dbd_lz_chimera_bait[is.na(uniq_pairs$dbd_lz_chimera_bait)] = FALSE
+
+uniq_pairs[wt_prey != wt_bait & !preyFlag & !baitFlag]
+```
+
+Only 36. They correspond in most cases to truncated variants on one side
+
+
+
+## Final set of barcode-variant pairs
+
+Now that we identified the WT bZ, we can see whether barcodes that are associated to several variants are assoicated to variants of the same bZ, in which case they are likely to be bar-var chimeras due to template switching during the PCR and that we can discard since PCRs were done per sample and not the pool and it is so unlikely that the exact same barcode gets two variants in the first place, so even less likely that by chance these two variants belong to the same bZ (54x less likely)
+
+
+```{r}
+# we care only about the ones where the bait is not flagged (but none of them has the bait flagged actually)
+tmp = uniq_pairs[Abc > 1 & !baitFlag]
+tmp2 = split(tmp,tmp$bc)
+tmp3 = unlist(mclapply(tmp2,function(x){
+  sum(x$wt_bait == x$wt_bait[1]) == nrow(x)
+},mc.cores=48))
+sum(tmp3)
+length(tmp2)
+```
+
+26,697 out of the 28,265 barcodes that are associated to more than one variant are indeed associated to a variant of the same bZ. We will thus just consider the ones with lower abundance to be chimeras and discard them
+
+But let's check the ones where it is not the case
+
+```{r}
+tmp2[!tmp3][[1]]
+tmp2[!tmp3][[2]]
+tmp2[!tmp3][[3]]
+tmp2[!tmp3][[4]]
+```
+
+These seem to be indeed dubious barcodes. I wouldn't expect them to be associated to more than 2 variants. There are ~1500 cases, so you would expect ~30 where two variants of the same proteins got the same barcode. If it's only 30 promiscuous barcodes that make it through, it's tolerable.
+
+But let's check the distribution of Rbc for the barcodes that are considered chimeras to make sure we don't keep ones with Rbc low enough to be confident they are dubious
+
+
+```{r}
+xx = do.call("rbind",lapply(tmp2,function(x){
+  x$Npair[1:2]
+}))
+plot(xx[,1],xx[,2],log="xy",xlab="reads with top variant",ylab="reads with second variant",pch=".")
+hist(log10(xx[,2]/xx[,1]),breaks=100,main="all barcodes with more than one variants",xlab="ratio read top/second variant")
+hist(log10(xx[tmp3,2]/xx[tmp3,1]),breaks=100,main="barcode with more than one variant but all from the same bZ",xlab="ratio read top/second variant")
+hist(log10(xx[!tmp3,2]/xx[!tmp3,1]),xlim=c(-4,0),breaks=100,main="barcode with more than one variant but NOT all from the same bZ",xlab="ratio read top/second variant")
+```
+
+Those that are on or close from the diagonal or on the right peak in the distribution are those that are clearly promiscuous. The left peak in the distribution is in my opinion chimeras. Those where the variants are not all from the same bZ don't have this left peak, which supports the fact that this left peak is chimeras that can happen only with the same bZ since the PCR are don't independently for each bZ
+
+A ratio of 0.01 seems to be good to discriminate chimeras from actual promiscuous barcodes. 
+
+```{r}
+# just make sure that uniq_pairs is still well sorted
+uniq_pairs = uniq_pairs[order(-Npair)]
+u2 = uniq_pairs[Abc > 1,]
+uniq_pairs = uniq_pairs[Abc == 1,]
+
+u2 = split(u2,u2$bc)
+u2 = do.call("rbind",lapply(u2,function(x){
+  
+  r = x$Npair / x$Npair[1]
+  
+  x[r > 0.01,]
+  
+}))
+uniq_pairs = rbind(uniq_pairs,u2)
+uniq_pairs = uniq_pairs[order(-Npair)]
+
+```
+
+We went from 930915 to 900539 uniq_pairs
+
+We now need to recompute Nbc, Rbc, Abc, Ava, etc
+
+
+```{r}
+
+Abc = table(uniq_pairs$bc)
+Ava = table(uniq_pairs$va)
+Abait = table(uniq_pairs$bait)
+Aprey = table(uniq_pairs$prey)
+Abait_prey = table(paste(uniq_pairs$bait,uniq_pairs$prey))
+
+Nbc = uniq_pairs[,.(Nbc=sum(Npair)), by='bc']
+Nva = uniq_pairs[,.(Nva=sum(Npair)), by='va']
+Nbait = uniq_pairs[,.(Nbait=sum(Npair)), by='bait']
+Nprey = uniq_pairs[,.(Nprey=sum(Npair)), by='prey']
+Nbait_prey = uniq_pairs[,.(Nbait_prey=sum(Npair)), by='bait,prey']
+
+uniq_pairs$Nbc = Nbc$Nbc[match(uniq_pairs$bc, Nbc$bc)]
+uniq_pairs$Nva = Nva$Nva[match(uniq_pairs$va, Nva$va)]
+uniq_pairs$Nbait = Nbait$Nbait[match(uniq_pairs$bait, Nbait$bait)]
+uniq_pairs$Nprey = Nprey$Nprey[match(uniq_pairs$prey, Nprey$prey)]
+uniq_pairs$Nbait_prey = Nbait_prey$Nbait_prey[match(paste(uniq_pairs$bait,uniq_pairs$prey), paste(Nbait_prey$bait,Nbait_prey$prey))]
+
+uniq_pairs$Rbc = uniq_pairs$Npair / uniq_pairs$Nbc
+uniq_pairs$Rva = uniq_pairs$Npair / uniq_pairs$Nva
+uniq_pairs$Rbait = uniq_pairs$Npair / uniq_pairs$Nbait
+uniq_pairs$Rprey = uniq_pairs$Npair / uniq_pairs$Nprey
+uniq_pairs$Rbait_prey = uniq_pairs$Npair / uniq_pairs$Nbait_prey
+
+uniq_pairs$Abc = Abc[uniq_pairs$bc]
+uniq_pairs$Ava = Ava[uniq_pairs$va]
+uniq_pairs$Abait = Abait[uniq_pairs$bait]
+uniq_pairs$Aprey = Aprey[uniq_pairs$prey]
+uniq_pairs$Abait_prey = Abait_prey[paste(uniq_pairs$bait,uniq_pairs$prey)]
+
+# reorganize columns
+uniq_pairs = uniq_pairs[,c(1,3,5,7,8,25,10,21,24,12:14,26:28,15,16,29:31,17,18,32:34,19,20,22,23,2,4,6,9)]
+names(uniq_pairs)[7] = "length_bc"
+
+```
+
+
+```{r}
+plot(log10(table(uniq_pairs$Abc)),ylab="frequency (log10)",xlab="No. variants per barcodes")
+```
+
+Expectation for number of barcodes that lend on several variants
+
+```{r}
+# function that computes the probability of two random barcodes of length L to have a Hamming distance of k
+nH = function(L,k){
+    choose(L,k)*3**k / 4^L
+}
+
+# probability that, for a given barcode, there is at least another one out the of nTrans transformants that has a Hamming distance of 0 is
+# P(X>=1) = 1-P(X=0)
+nTrans = 9e5
+barLength = 22
+p = 1-dbinom(0,nTrans, nH(barLength,0))
+
+# number of barcodes that can be expected to have been sampled at least twice is
+p*nTrans
+
+```
+
+There shouldn't be any actually. But that's considering that the distribution is homogenous, while we now that the effective complexity of random barcodes is lower than the theoretical complexity due to different coupling efficiencies, PCR amplification efficiency, etc
+
+Anyway, it's better to be stringent
+
+
+```{r}
+plot(Npair ~ Rbc, data=uniq_pairs,log="y", pch=".", main = "only considering barcodes not flagged as promiscuous")
+plot(Npair ~ Rbc, data=uniq_pairs[Abc > 1],log="y", pch=".", main = "only considering barcodes not flagged as promiscuous")
+hist(uniq_pairs$Rbc[uniq_pairs$Abc > 1],breaks=100)
+```
+
+All those that have Abc == 1 have Rbc == 1 by definition. All the others are flagged as promiscuous, although some still have quite high Rbc
+
+This increase close to 0.99 is due to actual chimeras that were just below the threshold. There are even a few above 0.99 unintuitively, but this is because the threshold was calculated as count second / count top, not count second / total count as is Rbc
+
+```{r}
+save(uniq_pairs,file="tmp_uniq_pairs.Rdata")
+```
+
+
+## identify close barcode neighbours
+
+To speed up the process, let's only look at neighbours within batches
+
+Remember that Jun is part of all 4 batches, and some Jun barcodes might have to be flagged because of neighbours in one batch but could be used in the other batch
+
+Because of that we will from now on split the association table into the four batches
+
+We also do it only for barcode of length 22 for now
+
+```{r}
+
+
+competition_batches = read.delim("000-data/TableS10_batches.txt")
+
+assoc = list(
+  b1 = uniq_pairs[uniq_pairs$wt_bait %in% competition_batches$gene[competition_batches$batch == 1],],
+  b2 = uniq_pairs[uniq_pairs$wt_bait %in% competition_batches$gene[competition_batches$batch == 2],],
+  b3 = uniq_pairs[uniq_pairs$wt_bait %in% competition_batches$gene[competition_batches$batch == 3],],
+  b4 = uniq_pairs[uniq_pairs$wt_bait %in% competition_batches$gene[competition_batches$batch == 4],]
+)
+
+p1 = proc.time()
+batches = lapply(1:4,function(x){
+  
+  cat("\r", x, "\t\t")
+  
+  tmp = assoc[[x]]
+  
+  u = unique(tmp$bc[tmp$length_bc == 22])
+  
+  s = ceiling(seq(0,length(u),length.out=61))
+
+  h = unlist(mclapply(1:(length(s)-1),function(i){
+    
+    unlist(lapply((s[i]+1):s[i+1],function(j){
+  
+      min(stringdist(u[j],u[-j],method="hamming",nthread = 1))
+      
+    }))
+    
+  }, mc.cores=60))
+  
+  tmp$dist_closest_neighbour = 100
+  tmp$dist_closest_neighbour = h[match(tmp$bc, u)]
+  
+  tmp
+
+})
+p2 = proc.time()
+p2-p1
+
+save(batches,file="tmp_batches.Rdata")
+```
+
+Not as long as I expected actually. Doing the whole thing would only take 4x longer in principle (here we're doing the diagonal of a matrix of 4x4 batches. The whole matrix is just 4x bigger, even a bit less since Jun wouldn't be repeated)
+
+
+
+```{r}
+
+unlist(lapply(batches, function(x){
+  
+  nrow(x[x$dist_closest_neighbour <= 4,]) / nrow(x)
+  
+}))
+
+```
+
+Quite a high number of pairs with a close neighbour (<=4) 
+
+```{r}
+
+unlist(lapply(batches, function(x){
+  
+  hist(x$dist_closest_neighbour[x$dist_closest_neighbour < 100], breaks=22)
+  
+}))
+
+```
+
+It seems like batches 2 and 3 have a heavier left tail, which probably represent more chimeras
+
+```{r}
+x = batches[[2]]
+head(x[x$dist_closest_neighbour <= 2])
+```
+
+Some of these are low complexity barcodes, e.g. runs of G or T with 1 or 2 different bp
+
+Let's have a look at one that is not low complexity
+
+```{r}
+h = stringdist("TGTTTGATGGTGGGAGTAATAT",x$bc,method="hamming")
+x[h <= 2]
+```
+
+This is clearly a case of close neighbours
+
+```{r}
+table(x$wt_prey[x$dist_closest_neighbour == 1])
+table(x$wt_bait[x$dist_closest_neighbour == 1])
+table(x$wt_prey[x$dist_closest_neighbour == 2])
+table(x$wt_bait[x$dist_closest_neighbour == 2])
+table(x$wt_prey[x$dist_closest_neighbour <= 4])
+table(x$wt_bait[x$dist_closest_neighbour <= 4])
+table(x$wt_prey)
+table(x$wt_bait)
+table(x$wt_prey) - table(x$wt_prey[x$dist_closest_neighbour <= 4])
+table(x$wt_bait) - table(x$wt_bait[x$dist_closest_neighbour <= 4])
+
+
+```
+
+Some are clearly over-represented for some reasons, but except for NRL, i.e. for ATF2 and ATF6B, they are also the more abundant
+
+The ones with low barcode counts are those that are not supposed to be part of the batch but somehow the prey made a chimera with a bait from the batch
+
+```{r}
+x = batches[[1]]
+table(x$wt_prey[x$dist_closest_neighbour == 1])
+table(x$wt_bait[x$dist_closest_neighbour == 1])
+table(x$wt_prey[x$dist_closest_neighbour == 2])
+table(x$wt_bait[x$dist_closest_neighbour == 2])
+table(x$wt_prey[x$dist_closest_neighbour <= 4])
+table(x$wt_bait[x$dist_closest_neighbour <= 4])
+table(x$wt_prey)
+table(x$wt_bait)
+table(x$wt_prey) - table(factor(x$wt_prey[x$dist_closest_neighbour <= 4], levels = sort(unique(x$wt_prey))))
+table(x$wt_bait) - table(factor(x$wt_bait[x$dist_closest_neighbour <= 4], levels = sort(unique(x$wt_bait))))
+
+
+```
+
+```{r}
+x = batches[[3]]
+table(x$wt_prey[x$dist_closest_neighbour == 1])
+table(x$wt_bait[x$dist_closest_neighbour == 1])
+table(x$wt_prey[x$dist_closest_neighbour == 2])
+table(x$wt_bait[x$dist_closest_neighbour == 2])
+table(x$wt_prey[x$dist_closest_neighbour <= 4])
+table(x$wt_bait[x$dist_closest_neighbour <= 4])
+table(x$wt_prey)
+table(x$wt_bait)
+table(x$wt_prey) - table(factor(x$wt_prey[x$dist_closest_neighbour <= 4], levels = sort(unique(x$wt_prey))))
+table(x$wt_bait) - table(factor(x$wt_bait[x$dist_closest_neighbour <= 4], levels = sort(unique(x$wt_bait))))
+
+```
+
+
+```{r}
+x = batches[[4]]
+table(x$wt_prey[x$dist_closest_neighbour == 1])
+table(x$wt_bait[x$dist_closest_neighbour == 1])
+table(x$wt_prey[x$dist_closest_neighbour == 2])
+table(x$wt_bait[x$dist_closest_neighbour == 2])
+table(x$wt_prey[x$dist_closest_neighbour <= 4])
+table(x$wt_bait[x$dist_closest_neighbour <= 4])
+table(x$wt_prey)
+table(x$wt_bait)
+table(x$wt_prey) - table(factor(x$wt_prey[x$dist_closest_neighbour <= 4], levels = sort(unique(x$wt_prey))))
+table(x$wt_bait) - table(factor(x$wt_bait[x$dist_closest_neighbour <= 4], levels = sort(unique(x$wt_bait))))
+
+
+```
+
+It affects overall some bZIPs more than others. Batch 4 didn't get any of these bZIPs so it was not affected
+
+If these are mostly bad barcodes then we can just filter them out. There seems to be enough barcodes anyway.
+
+Let's call variants now and see whether filtering these out make us loose a lot of expected variants
+
+
+## call variants
+
+```{r, message=FALSE}
+baits = uniq_pairs[!duplicated(uniq_pairs$bait),c("bait","wt_bait")]
+preys = uniq_pairs[!duplicated(uniq_pairs$prey),c("prey","wt_prey")]
+# we don't need to call variants for those that have been flagged because their sequence is weird, because we won't care about them
+preys = preys[preys$wt_prey != "flagged",]
+
+# add one or two bp from the restriction site if the nt seq length is not a mutliple of 3
+n = nchar(baits$bait) %% 3
+baits$s2 = baits$bait
+baits$s2[n == 2] = paste0("T",baits$s2[n == 2])
+baits$s2[n == 1] = paste0("GT",baits$s2[n == 1])
+
+s = ceiling(seq(0,nrow(baits),length.out=49))
+baits$aa = unlist(mclapply(1:(length(s)-1),function(i){
+  as.character(translate(reverseComplement(DNAStringSet(baits$s2[(s[i]+1):s[i+1]])), no.init.codon = TRUE))
+},mc.cores=48))
+
+
+
+# for preys, we need to remove the first 4nt, which are part of the overhang. We will just assume they are the correct one, otherwise the cloning wouldn't have worked
+preys$s2 = str_sub(preys$prey,5,-1)
+n = nchar(preys$s2) %% 3
+preys$s2[n == 2] = paste0(preys$s2[n == 2],"A")
+preys$s2[n == 1] = paste0(preys$s2[n == 1],"AA")
+
+s = ceiling(seq(0,nrow(preys),length.out=49))
+preys$aa = unlist(mclapply(1:(length(s)-1),function(i){
+  as.character(translate(DNAStringSet(preys$s2[(s[i]+1):s[i+1]]), no.init.codon = TRUE))
+},mc.cores=48))
+
+```
+
+Check that the last aa for those that have the correct size is indeed a stop
+
+```{r}
+tmp = baits$aa[nchar(baits$aa) == 63]
+tmp2 = str_sub(tmp,-1,-1) == "*"
+sum(tmp2)
+length(tmp)
+
+tmp = preys$aa[nchar(preys$aa) == 36]
+tmp2 = str_sub(tmp,-1,-1) == "*"
+sum(tmp2)
+length(tmp)
+```
+
+Pretty good. Those that don't end with a stop look anyway a bit weird, probably represent low frequency variants, and will not really be used in the data analysis so should probably be flagged
+
+
+
+First, we match those that are expected from the oligo synthesis
+
+```{r}
+
+baits$id = twist$id[match(baits$bait, twist$var2)]
+baits$expected_bait = TRUE
+baits$expected_bait[is.na(baits$id)] = FALSE
+preys$id = twist$id[match(preys$prey, twist$var1)]
+preys$expected_prey = TRUE
+preys$expected_prey[is.na(preys$id)] = FALSE
+
+rbind(bait = c(nrow(baits[baits$expected_bait,]), nrow(baits), nrow(baits[baits$expected_bait,]) / nrow(baits)),
+      prey = c(nrow(preys[preys$expected_prey,]), nrow(preys), nrow(preys[preys$expected_prey,]) / nrow(preys))
+)
+
+```
+
+Out of 37814 possible variants, that's a great coverage
+
+
+
+Now we need to identify what are the other variants
+
+First, we match the corresponding WT aa sequence
+
+
+```{r}
+wt_aa = read.delim("000-data/TableS6_wt_bZIPs_aa_seq.txt")
+wt_aa$bait = paste0(wt_aa$bZIP_aa,"*")
+wt_aa$prey = str_sub(wt_aa$bait, 28,-1)
+
+baits$wt_aa = wt_aa$bait[match(baits$wt_bait, wt_aa$Gene)]
+preys$wt_aa = wt_aa$prey[match(preys$wt_prey, wt_aa$Gene)]
+
+```
+
+
+Then, we identify which position are different from WT
+
+For this, we will limit ourselves to variants of the expected lengths. If we want to analyze indels later on, we can identify the mutation from the sequence then
+
+
+```{r}
+
+# first baits
+baits$id[!baits$expected_bait & baits$aa == baits$wt_aa] = "0xx"
+
+# we keep expected variants (except WT ones) so that we can get their position, wt_aa, etc
+baits62 = baits[nchar(baits$aa) == 62 & nchar(baits$wt_aa) == 62 & baits$aa != baits$wt_aa,]
+baits63 = baits[nchar(baits$aa) == 63 & nchar(baits$wt_aa) == 63 & baits$aa != baits$wt_aa,]
+
+
+# baits with 62 aa (ATF1 and CREB1)
+tmp1 = do.call("rbind",strsplit(baits62$aa,""))
+tmp2 = do.call("rbind",strsplit(baits62$wt_aa,""))
+tmp3 = tmp1 != tmp2
+
+w = which(tmp3,arr.ind=T)
+w = split(w[,2],w[,1])
+mut = as.data.frame(do.call("rbind",lapply(1:length(w),function(i){
+  pos = w[[i]]
+  mut_aa = tmp1[i,pos]
+  wt_aa = tmp2[i,pos]
+  id = paste(wt_aa,pos,mut_aa,sep="")
+  l = length(pos)
+  bZ_pos = conv_to_bZ_nomenclature(pos-27,mut_aa)
+  c(
+    l,
+    paste(pos,collapse=","),
+    paste(wt_aa,collapse=","),
+    paste(mut_aa,collapse=","),
+    paste(id,collapse=","),
+    paste(bZ_pos$id,collapse=",")
+  )
+})))
+names(mut) = c("Nmut","pos","wtAA","mutAA","std_id","id")
+
+baits62 = cbind(baits62[,c(1:4,6,7)], mut)
+
+
+# baits with 63 aa
+tmp1 = do.call("rbind",strsplit(baits63$aa,""))
+tmp2 = do.call("rbind",strsplit(baits63$wt_aa,""))
+tmp3 = tmp1 != tmp2
+
+w = which(tmp3,arr.ind=T)
+w = split(w[,2],w[,1])
+mut = as.data.frame(do.call("rbind",mclapply(1:length(w),function(i){
+  pos = w[[i]]
+  mut_aa = tmp1[i,pos]
+  wt_aa = tmp2[i,pos]
+  id = paste(wt_aa,pos,mut_aa,sep="")
+  l = length(pos)
+  bZ_pos = conv_to_bZ_nomenclature(pos-27,mut_aa)
+  c(
+    l,
+    paste(pos,collapse=","),
+    paste(wt_aa,collapse=","),
+    paste(mut_aa,collapse=","),
+    paste(id,collapse=","),
+    paste(bZ_pos$id,collapse=",")
+  )
+},mc.cores=48)))
+names(mut) = c("Nmut","pos","wtAA","mutAA","std_id","id")
+
+baits63 = cbind(baits63[,c(1:4,6,7)], mut)
+
+
+
+# now preys
+preys$id[!preys$expected_prey & preys$aa == preys$wt_aa] = "0xx"
+
+# preys are 27 aa shorter
+preys35 = preys[nchar(preys$aa) == 35 & nchar(preys$wt_aa) == 35 & preys$aa != preys$wt_aa,]
+preys36 = preys[nchar(preys$aa) == 36 & nchar(preys$wt_aa) == 36 & preys$aa != preys$wt_aa,]
+
+
+# preys with 35 aa (ATF1 and CREB1)
+tmp1 = do.call("rbind",strsplit(preys35$aa,""))
+tmp2 = do.call("rbind",strsplit(preys35$wt_aa,""))
+tmp3 = tmp1 != tmp2
+
+w = which(tmp3,arr.ind=T)
+w = split(w[,2],w[,1])
+mut = as.data.frame(do.call("rbind",lapply(1:length(w),function(i){
+  pos = w[[i]]
+  mut_aa = tmp1[i,pos]
+  wt_aa = tmp2[i,pos]
+  id = paste(wt_aa,pos,mut_aa,sep="")
+  l = length(pos)
+  bZ_pos = conv_to_bZ_nomenclature(pos,mut_aa)
+  c(
+    l,
+    paste(pos,collapse=","),
+    paste(wt_aa,collapse=","),
+    paste(mut_aa,collapse=","),
+    paste(id,collapse=","),
+    paste(bZ_pos$id,collapse=",")
+  )
+})))
+names(mut) = c("Nmut","pos","wtAA","mutAA","std_id","id")
+
+preys35 = cbind(preys35[,c(1:4,6,7)], mut)
+
+
+# preys with 36 aa
+tmp1 = do.call("rbind",strsplit(preys36$aa,""))
+tmp2 = do.call("rbind",strsplit(preys36$wt_aa,""))
+tmp3 = tmp1 != tmp2
+
+w = which(tmp3,arr.ind=T)
+w = split(w[,2],w[,1])
+mut = as.data.frame(do.call("rbind",mclapply(1:length(w),function(i){
+  pos = w[[i]]
+  mut_aa = tmp1[i,pos]
+  wt_aa = tmp2[i,pos]
+  id = paste(wt_aa,pos,mut_aa,sep="")
+  l = length(pos)
+  bZ_pos = conv_to_bZ_nomenclature(pos,mut_aa)
+  c(
+    l,
+    paste(pos,collapse=","),
+    paste(wt_aa,collapse=","),
+    paste(mut_aa,collapse=","),
+    paste(id,collapse=","),
+    paste(bZ_pos$id,collapse=",")
+  )
+},mc.cores=48)))
+names(mut) = c("Nmut","pos","wtAA","mutAA","std_id","id")
+
+preys36 = cbind(preys36[,c(1:4,6,7)], mut)
+
+
+
+
+k62 = nchar(baits$aa) == 62 & nchar(baits$wt_aa) == 62 & baits$aa != baits$wt_aa
+k63 = nchar(baits$aa) == 63 & nchar(baits$wt_aa) == 63 & baits$aa != baits$wt_aa
+baits$id_bait[k62] = baits62$id
+baits$id_bait[k63] = baits63$id
+baits$Nmut_bait = 64
+baits$Nmut_bait[!is.na(baits$id) & baits$id == "0xx"] = 0
+baits$Nmut_bait[k62] = as.numeric(baits62$Nmut)
+baits$Nmut_bait[k63] = as.numeric(baits63$Nmut)
+baits$pos_bait = 64
+baits$pos_bait[!is.na(baits$id) & baits$id == "0xx"] = 0
+baits$pos_bait[k62] = baits62$pos
+baits$pos_bait[k63] = baits63$pos
+baits$wt_aa_bait = ""
+baits$wt_aa_bait[k62] = baits62$wtAA
+baits$wt_aa_bait[k63] = baits63$wtAA
+baits$mut_aa_bait = ""
+baits$mut_aa_bait[k62] = baits62$mutAA
+baits$mut_aa_bait[k63] = baits63$mutAA
+baits$std_id_bait = ""
+baits$std_id_bait[k62] = baits62$std_id
+baits$std_id_bait[k63] = baits63$std_id
+baits = baits[,c(1,4,6,9,8,13,10,11,12)]
+names(baits)[2] = "bait_aa"
+baits$bait_ends_stop = str_sub(baits$bait_aa,-1,-1) == "*"
+
+k35 = nchar(preys$aa) == 35 & nchar(preys$wt_aa) == 35 & preys$aa != preys$wt_aa
+k36 = nchar(preys$aa) == 36 & nchar(preys$wt_aa) == 36 & preys$aa != preys$wt_aa
+preys$id_prey[k35] = preys35$id
+preys$id_prey[k36] = preys36$id
+preys$Nmut_prey = 64
+preys$Nmut_prey[!is.na(preys$id) & preys$id == "0xx"] = 0
+preys$Nmut_prey[k35] = as.numeric(preys35$Nmut)
+preys$Nmut_prey[k36] = as.numeric(preys36$Nmut)
+preys$pos_prey = 64
+preys$pos_prey[!is.na(preys$id) & preys$id == "0xx"] = 0
+preys$pos_prey[k35] = preys35$pos
+preys$pos_prey[k36] = preys36$pos
+preys$wt_aa_prey = ""
+preys$wt_aa_prey[k35] = preys35$wtAA
+preys$wt_aa_prey[k36] = preys36$wtAA
+preys$mut_aa_prey = ""
+preys$mut_aa_prey[k35] = preys35$mutAA
+preys$mut_aa_prey[k36] = preys36$mutAA
+preys$std_id_prey = ""
+preys$std_id_prey[k35] = preys35$std_id
+preys$std_id_prey[k36] = preys36$std_id
+preys = preys[,c(1,4,6,9,8,13,10,11,12)]
+names(preys)[2] = "prey_aa"
+preys$prey_ends_stop = str_sub(preys$prey_aa,-1,-1) == "*"
+
+```
+
+
+
+Now we match these back to the pairs
+
+
+```{r}
+uniq_pairs = cbind(uniq_pairs, 
+                   preys[match(uniq_pairs$prey, preys$prey),2:10],
+                   baits[match(uniq_pairs$bait, baits$bait),2:10]
+                   )
+# because of the flagged ones
+uniq_pairs$expected_prey[is.na(uniq_pairs$expected_prey)] = FALSE
+```
+
+
+## statistics on library composition
+
+```{r}
+# number of pairs where both the bait and the prey are expected
+nrow(uniq_pairs[expected_prey & expected_bait]) / nrow(uniq_pairs)
+# fraction of reads where both the bait and prey are expected
+sum(uniq_pairs$Npair[uniq_pairs$expected_prey & uniq_pairs$expected_bait], na.rm=T) / sum(uniq_pairs$Npair)
+
+# fraction of reads expected in the heterodimer library (=bait only)
+sum(uniq_pairs$Npair[uniq_pairs$expected_bait]) / sum(uniq_pairs$Npair)
+
+# fraction of reads where both the bait and prey are the same and expected
+sum(uniq_pairs$Npair[uniq_pairs$expected_prey & uniq_pairs$expected_bait & uniq_pairs$wt_bait == uniq_pairs$wt_prey & uniq_pairs$id_bait == uniq_pairs$id_prey], na.rm=T) / sum(uniq_pairs$Npair)
+
+# fraction of reads where both the bait and prey are the same and UNexpected
+sum(uniq_pairs$Npair[!uniq_pairs$expected_prey & !uniq_pairs$expected_bait & uniq_pairs$wt_bait == uniq_pairs$wt_prey & uniq_pairs$id_bait == uniq_pairs$id_prey], na.rm=T) / sum(uniq_pairs$Npair)
+
+
+```
+
+Very good for heterodimers. For homodimers, we know it's relatively low but it's ok because the library is small. When the bait or prey is unexpected, it rarely corresponds to each other, which is not surprising
+
+
+
+
+## let's now identify the closest barcode for each barcode
+
+```{r}
+p1 = proc.time()
+
+u = unique(uniq_pairs$bc[uniq_pairs$length_bc == 22])
+
+s = ceiling(seq(0,length(u),length.out=49))
+
+h = unlist(mclapply(1:(length(s)-1),function(i){
+  
+  unlist(lapply((s[i]+1):s[i+1],function(j){
+
+    min(stringdist(u[j],u[-j],method="hamming",nthread = 1))
+    
+  }))
+  
+}, mc.cores=48))
+
+uniq_pairs$dist_closest_neighbour = 100
+uniq_pairs$dist_closest_neighbour = h[match(uniq_pairs$bc, u)]
+
+
+p2 = proc.time()
+p2-p1
+```
+
+
+
+Let's also flag those preys that have a mutation in the type IIs overhang (because these are not considered wehn calling amino acid variants above, on the basis that they won't make it to the DBD cloning step, but some have mutations in the overhang so it's good to flag them anyway)
+
+
+```{r}
+
+wt_nt_dbd = read.delim("000-data/TableS7_DBD_gBlock_sequences.txt")
+tmp = wt_nt_dbd$bZIP
+wt_nt_dbd = substr(wt_nt_dbd$seq,84,87)
+names(wt_nt_dbd) = tmp
+
+
+prey_ov = substr(uniq_pairs$prey,1,4)
+
+uniq_pairs$flag_prey_ov = prey_ov != wt_nt_dbd[uniq_pairs$wt_prey] 
+
+save(uniq_pairs,file="001-barcode_variants_association_table.Rdata")
+write.table(uniq_pairs,file="000-data/TableS8_barcode_variants_association.txt",sep="\t",quote=F,row.names=F)
+
+```
+
+

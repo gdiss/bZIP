@@ -1,0 +1,489 @@
+---
+title: "002 -process raw data into logFC"
+author: "Guillaume Diss"
+date: '2023-02-03'
+output:
+  html_document:
+    code_folding: show
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+
+# Load packages
+
+```{r}
+suppressPackageStartupMessages({
+  library(parallel)
+  library(mutscan)
+  library(rgl)
+  library(stringdist)
+  library(ggplot2)
+  library(data.table)
+  library(Biostrings)
+  library(readxl)
+  library(stringr)
+})
+```
+
+
+# Data description
+
+
+```{r}
+# sample description
+desc = read.delim("000-data/TableS11_sequencing_libraries.txt")
+tmp = do.call("rbind",strsplit(desc$Sample_Name,"_"))
+tmp1 = do.call("rbind",strsplit(tmp[,1],"\\."))
+tmp2 = do.call("rbind",strsplit(tmp[,2],"\\."))
+desc$batch = tmp1[,1]
+desc$rep = tmp1[,2]
+desc$io = tmp2[,1]
+desc$index = tmp2[,2]
+desc = desc[rep(1:nrow(desc),each=4),] # duplicate each index 4x, one for each lane on the flow cell
+desc$lane = 1:4
+
+
+# sample names
+datapath = "/tungstenfs/groups/gbioinfo/seqdata"
+
+samples <- dir(datapath)[grep("3160F",dir(datapath))]
+samples = samples[grep(".fastq.gz",samples)]
+samples = samples[!grepl("Undetermined",samples)]
+
+# There are 220 files, because there are 55 different indexes (several indexes per sample), and the S4 flowcell has 4 lanes. This generates one file per index and per lane
+
+# we need to order them 
+tmp = do.call("rbind",strsplit(samples,"-"))[,1]
+tmp = as.numeric(do.call("rbind",strsplit(tmp,"F"))[,2])
+
+samples = samples[order(tmp)]
+samples = file.path(datapath, samples)
+
+# make a list of files corresponding to all index of each samples
+samples_l = split(samples, list(desc$io, desc$rep, desc$batch))
+
+
+# batch composition
+batches = read.delim("000-data/TableS10_batches.txt")
+
+```
+
+
+# Load data
+
+```{r}
+# table of barcode variant association
+load("001-barcode_variants_association_table.Rdata")
+
+# filter out barcodes that can't be used (not correct length, promiscuous or close neighbour)
+uniq_pairs = uniq_pairs[uniq_pairs$length_bc == 22 & uniq_pairs$dist_closest_neighbour > 1 & uniq_pairs$Abc == 1,]
+
+# the id for WT has not been set correctly in the barcode-variant association script. Fix it
+uniq_pairs$id_bait[uniq_pairs$Nmut_bait == 0] = "0xx"
+uniq_pairs$id_prey[uniq_pairs$Nmut_prey == 0] = "0xx"
+uniq_pairs$std_id_bait[uniq_pairs$Nmut_bait == 0] = "x0x"
+uniq_pairs$std_id_prey[uniq_pairs$Nmut_prey == 0] = "x0x"
+
+
+
+# wt AA sequence
+wt_seq = read.delim("000-data/TableS6_wt_bZIPs_aa_seq.txt")
+tmp = wt_seq$Gene
+wt_seq = wt_seq$bZIP_aa
+names(wt_seq) = tmp
+
+# wt nt sequence for preys
+wt_nt_seq = read.csv("000-data/TableS9_wt_preys_gblocks_and_barcodes.txt")
+wt_nt_seq$seq = substr(wt_nt_seq$seq,983,1500)
+str_sub(wt_nt_seq$seq,-6,-1) = ""
+wt_bar = wt_nt_seq$barcode
+names(wt_bar) = wt_nt_seq$bZIP
+tmp = wt_nt_seq$bZIP
+wt_nt_seq = wt_nt_seq$seq
+names(wt_nt_seq) = tmp
+
+
+```
+
+
+
+
+# Format the barcode-variant association table
+
+We want to reverse complement the bait nt sequence and translate it.
+
+Compared to the homodimer and abundance data processing, here we will filter out only the bait flags because preys are removed and replaced by the WT, so even if the prey variant was incorrect, as long as the bait is ok it is present in the library
+
+
+```{r, warning=F}
+uniq_pairs$finalBaitNt = as.character(reverseComplement(DNAStringSet(uniq_pairs$bait)))
+
+# add one or two bp from the restriction site if the nt seq length is not a mutliple of 3
+n = nchar(uniq_pairs$finalBaitNt) %% 3
+
+tmp = do.call("rbind",strsplit(uniq_pairs$va[n==2],uniq_pairs$bait[n==2]))[,1]
+r = as.character(reverseComplement(DNAStringSet(str_sub(tmp,-1,-1))))
+uniq_pairs$finalBaitNt[n==2] = paste0(uniq_pairs$finalBaitNt[n==2],r)
+
+tmp = do.call("rbind",strsplit(uniq_pairs$va[n==1],uniq_pairs$bait[n==1]))[,1]
+r = as.character(reverseComplement(DNAStringSet(str_sub(tmp,-2,-1))))
+uniq_pairs$finalBaitNt[n==1] = paste0(uniq_pairs$finalBaitNt[n==1],r)
+
+uniq_pairs$finalBaitAA = as.character(translate(DNAStringSet(uniq_pairs$finalBaitNt),no.init.codon=T))
+# I checked, all those flagged as ending with stop indeed end with a stop here as well
+
+uniq_pairs[,bait_aa:=NULL]
+
+uniq_pairs = uniq_pairs[
+    uniq_pairs$cst3 != "dubious" & 
+    !is.na(uniq_pairs$id_bait) & 
+    uniq_pairs$bait_ends_stop & 
+    !uniq_pairs$baitFlag
+    ,]
+
+```
+
+
+
+
+# Load raw data
+
+Directly filter out reads that don't perfectly match expected barcodes
+
+```{r}
+
+raw2 = list()
+
+for (i in 1:24){
+  
+  cat("\r",i,"\t\t")
+  
+  load(paste0("002-digestedFastqs/no_collapse_sample_ ",i))
+  
+  cat("loaded\t\t")
+  
+  bc_var = substr(raw$summaryTable$sequence,1,22)
+  bc_wt = substr(raw$summaryTable$sequence,23,29)
+  
+  raw$summaryTable = raw$summaryTable[bc_var %in% uniq_pairs$bc & bc_wt %in% wt_bar,]
+  
+  cat("filtered\t\t")
+
+  raw2[[i]] = raw
+  
+}
+names(raw2) = names(samples_l)
+
+```
+
+
+
+# summarize Experiments
+
+We first make one summarizeExperiment object per batch based on barcode sequences. Then we match barcodes and collapse per AA sequence and make a summarizeExperiment per batch again
+
+
+```{r}
+
+coldata = data.frame(Name = names(samples_l),
+                       condition = rep(c("input", "output"),3),
+                       replicate = c("1", "1", "2", "2", "3", "3")
+)
+
+
+
+tmp = list(
+  1:6,
+  7:12,
+  13:18,
+  19:24
+)
+
+se = mclapply(1:4,function(i){
+  summarizeExperiment(
+    x = raw2[tmp[[i]]],
+    coldata = coldata[tmp[[i]],],
+    countType = "reads"
+    )
+},mc.cores=4)
+
+save(se, file="003-summarizedExperiments_barcodes.Rdata")
+rm(raw, raw2)
+
+
+```
+
+
+
+
+
+
+# collapse to AA sequence
+
+For the prey side we can collapse to gene name since there's only one sequence per gene
+
+```{r}
+
+se_coll_aa = mclapply(1:4, function(i){
+  
+  x = se[[i]]
+  
+  
+  # subset barcodes to keep only those from the batch
+  tmp_bar = uniq_pairs[uniq_pairs$wt_bait %in% batches$gene[batches$batch == i],]
+  
+  
+  # chop the barcode into variant and wt
+  bar = x@elementMetadata@listData$mutantName
+  bar = cbind(substr(bar,1,22),substr(bar,23,29))
+  
+  # match to expected barcode sequences
+  k_var = match(bar[,1], tmp_bar$bc)
+  k_wt = match(bar[,2], wt_bar)
+  
+  # id for collapsing, i.e. wt prey ID fused to bait nt sequence
+  id = paste( names(wt_bar)[k_wt],
+              tmp_bar$finalBaitAA[k_var],
+              sep="_"
+  )
+  
+  # remove those not from the batch
+  id = id[!is.na(k_var)]
+  
+  
+  collapsedCounts <- Matrix.utils::aggregate.Matrix(
+    x = SummarizedExperiment::assay(x, "counts")[!is.na(k_var),],  # remove those not from the batch
+    groupings = factor(id), 
+    fun = "colSums") 
+  
+  SummarizedExperiment::SummarizedExperiment(
+    assays = list(counts = collapsedCounts),
+    colData = SummarizedExperiment::colData(x), 
+    metadata = S4Vectors::metadata(x)
+  )
+  
+  
+}, mc.cores=4)
+
+
+save(se_coll_aa, file="003-summarizedExperiment_AA.Rdata")
+
+```
+
+
+
+
+
+
+# LFC
+
+```{r}
+
+lfc_he_aa = mclapply(1:4, function(i){
+  
+  x = se_coll_aa[[i]]
+  
+  calculateRelativeFC(
+    se = x,
+    design = model.matrix(~ replicate + condition,
+                          data = coldata[tmp[[i]],]),
+    coef = "conditionoutput", pseudocount = 1,
+    method = "limma") 
+  
+}, mc.cores=4)
+
+
+```
+
+
+
+
+# Format data
+
+We want to merge LFCs with read counts, and get the other variant features 
+
+```{r}
+
+# we first order because in case of synonymous mutation that were not expected, some features might not have been determined. So it is better that the expected one comes before its unexpected synonymous variant, so that we get the features
+uniq_pairs = uniq_pairs[order(uniq_pairs$expected_bait, decreasing = T),]
+uniq_pairs$full_id_bait = paste(uniq_pairs$wt_bait, uniq_pairs$std_id_bait, sep="_")
+
+variant_features_baits = uniq_pairs[!duplicated(uniq_pairs$finalBaitAA),c(55,29,46,45,47:49,44,43,54,6)]
+
+
+# merge read counts and LFcs
+
+lfc_he_aa = mclapply(1:4,function(i){
+  
+  x = lfc_he_aa[[i]]
+  
+  ids = do.call("rbind",strsplit(rownames(x),"_"))
+  tmp = match(ids[,2], variant_features_baits$finalBaitAA)
+  
+  x = data.frame(full_id_bait = variant_features_baits$full_id_bait[tmp], 
+                    as.matrix(SummarizedExperiment::assay(se_coll_aa[[i]], "counts")),
+                    x)
+  names(x)[2:7] = c("i1","o1","i2","o2","i3","o3")
+  
+  x = cbind(x,variant_features_baits[tmp,2:ncol(variant_features_baits)])
+  
+  
+  x$full_id_prey = paste0(ids[,1],"_x0x")
+  x$finalPreyAA = wt_seq[ids[,1]]
+  
+  x = x[,c(1,29,2:27,30,28)]
+  
+},mc.cores=4)
+
+
+
+```
+
+
+
+
+# Merge batches
+
+First check correlation between jun variants in the 4 batches, i.e. library overlap
+
+
+We need to normalize batches according to Jun differences. Differences are linear, so we can simply correct with a linear scaling. Let's use a total least square regression so that the variance on the two dimensions is taken into account (in a normal linear regression, only the variance in y, i.e. the vertical residuals, are minimized).
+
+
+```{r}
+
+jun = lapply(lfc_he_aa,function(x){
+  
+  x[x$wt_bait == "JUN" & x$expected_bait & x$i1 > 10 & x$i2 > 10 & x$i3 > 10 & x$o1 > 0 & x$o2 > 0 & x$o3 > 0,]
+  
+})
+
+jun2 = merge(jun[[1]],jun[[2]],by=c("finalBaitAA","full_id_prey"),all=T)
+names(jun2)[grep("^logFC",names(jun2))] = c("logFC_batch1","logFC_batch2")
+jun2 = merge(jun2,jun[[3]],by=c("finalBaitAA","full_id_prey"),all=T)
+jun2 = merge(jun2,jun[[4]],by=c("finalBaitAA","full_id_prey"),all=T)
+names(jun2)[grep("^logFC",names(jun2))] = c("logFC_batch1","logFC_batch2","logFC_batch3","logFC_batch4")
+
+jun3 = jun2[,grep("^logFC",names(jun2))]
+
+pairs(jun3,pch=".")
+
+
+par(mfrow=c(2,3))
+plot(jun3[,1],jun3[,2],pch=".")
+abline(0,1)
+plot(jun3[,1],jun3[,3],pch=".")
+abline(0,1)
+plot(jun3[,1],jun3[,4],pch=".")
+abline(0,1)
+plot(jun3[,2],jun3[,3],pch=".")
+abline(0,1)
+plot(jun3[,2],jun3[,4],pch=".")
+abline(0,1)
+plot(jun3[,3],jun3[,4],pch=".")
+abline(0,1)
+
+cor(jun3,use="pairwise.complete.obs")
+
+
+```
+
+
+
+We normalize them all to batch 1, chosen arbitrarily
+
+
+```{r}
+
+tls <- function(X,y){
+
+  xx = cbind(X,y)
+  xx = xx[!is.na(rowSums(xx)),]
+  v <- prcomp(xx)$rotation
+  beta <- -v[-ncol(v),ncol(v)] / v[ncol(v),ncol(v)]
+  beta0 = mean(xx[,2])-sum(mean(xx[,1])*beta)
+  c(beta,beta0)
+
+}
+
+
+p = sapply(2:4,function(i){
+  tls(jun3[,i],jun3[,1])
+})
+
+
+plot(jun3[,2],jun3[,1],col="#00000010")
+abline(p[2,1],p[1,1])
+plot(jun3[,3],jun3[,1],col="#00000010")
+abline(p[2,2],p[1,2])
+plot(jun3[,4],jun3[,1],col="#00000010")
+abline(p[2,3],p[1,3])
+
+```
+
+
+Then we keep only JUN in the second batch (because it has more data than the other batches), and row bind the 4 batches
+
+We also need to recalculate the standard error. We don't care about the p-value and FDR at this point because they represent the difference to 0
+
+```{r}
+for(i in 2:4){
+  
+  lfc_he_aa[[i]]$logFC = lfc_he_aa[[i]]$logFC * p[1,i-1] + p[2,i-1]
+  lfc_he_aa[[i]]$se.logFC = p[1,i-1] * lfc_he_aa[[i]]$se.logFC
+  
+}
+```
+
+Let's check again
+
+```{r}
+
+jun = lapply(lfc_he_aa,function(x){
+  
+  x = x[x$wt_bait == "JUN" & x$expected_bait,]
+  x[x$i1 > 10 & x$i2 > 10 & x$i3 > 10 & x$o1 > 0 & x$o2 > 0 & x$o3 > 0,]
+  
+})
+
+jun2 = merge(jun[[1]],jun[[2]],by=c("finalBaitAA","full_id_prey"),all=T)
+names(jun2)[grep("^logFC",names(jun2))] = c("logFC_batch1","logFC_batch2")
+jun2 = merge(jun2,jun[[3]],by=c("finalBaitAA","full_id_prey"),all=T)
+jun2 = merge(jun2,jun[[4]],by=c("finalBaitAA","full_id_prey"),all=T)
+names(jun2)[grep("^logFC",names(jun2))] = c("logFC_batch1","logFC_batch2","logFC_batch3","logFC_batch4")
+
+jun3 = jun2[,grep("^logFC",names(jun2))]
+
+plot(jun3[,2],jun3[,1],col="#00000010")
+abline(0,1)
+plot(jun3[,3],jun3[,1],col="#00000010")
+abline(0,1)
+plot(jun3[,4],jun3[,1],col="#00000010")
+abline(0,1)
+
+```
+
+
+
+```{r}
+lfc_he_aa[c(1,3,4)] = lapply(lfc_he_aa[c(1,3,4)],function(x){
+  
+  x[x$wt_bait != "JUN",]
+  
+})
+
+lfc_he_aa = do.call("rbind",lfc_he_aa)
+
+
+save(lfc_he_aa, file="003-lfc_limma_AA_per_batch.Rdata")
+
+
+```
+
+
+
+

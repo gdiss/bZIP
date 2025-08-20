@@ -1,0 +1,111 @@
+---
+title: "001 - digestFastq for heterodimer"
+author: "Guillaume Diss"
+date: '2023-02-03'
+output: html_document
+output:
+  html_document:
+    code_folding: show
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+
+## Introduction
+
+We've already tested whether we should collapse barcodes with a distance of 1 and 2 and decided that the small increase in read counts (a few percent) was not worth the increase in barcodes that need filtered out because the with a higher collapse distance, the minimal distance between barcode sequences that we can tolerate also increases
+
+
+## Load packages
+
+```{r}
+suppressPackageStartupMessages({
+  library(parallel)
+  library(mutscan)
+})
+```
+
+
+
+## Data description
+
+```{r}
+
+# sample description
+desc = read.delim("000-data/TableS11_sequencing_libraries.txt")
+tmp = do.call("rbind",strsplit(desc$Sample_Name,"_"))
+tmp1 = do.call("rbind",strsplit(tmp[,1],"\\."))
+tmp2 = do.call("rbind",strsplit(tmp[,2],"\\."))
+desc$batch = tmp1[,1]
+desc$rep = tmp1[,2]
+desc$io = tmp2[,1]
+desc$index = tmp2[,2]
+desc = desc[rep(1:nrow(desc),each=4),] # duplicate each index 4x, one for each lane on the flow cell
+desc$lane = 1:4
+
+
+
+# sample names
+datapath = "000-data"
+
+samples <- dir(datapath)[grep("3160F",dir(datapath))]
+samples = samples[grep(".fastq.gz",samples)]
+samples = samples[!grepl("Undetermined",samples)]
+
+# There are 220 files, because there are 55 different indexes (several indexes per sample), and the S4 flowcell has 4 lanes. This generates one file per index and per lane
+
+# we need to order them because 
+tmp = do.call("rbind",strsplit(samples,"-"))[,1]
+tmp = as.numeric(do.call("rbind",strsplit(tmp,"F"))[,2])
+
+samples = samples[order(tmp)]
+samples = file.path(datapath, samples)
+
+# make a list of files corresponding to all index of each samples
+samples_l = split(samples, list(desc$io, desc$rep, desc$batch))
+
+```
+
+
+
+The amplicon has the following structure:
+
+RE - bar - RE - WT bar
+
+6  - 22  - 6  -   7   
+
+
+This time, we look for the perfect position of the restriction sites so that the bc is always 22bp, which represent the vast majority of them anyway, and so that we can collapse barcode reads
+
+To speed up the process, we don't look for a match of the constant sequences, we just skip them. Anyway, these are restriction sites and the cloning wouldn't have worked if there was a mutation. It could allow to filter-out weird reads, but since we're looking for perfect barcode matches, we don't care because if the two barcodes matches expected one, it's not coincidence
+
+## digest Fastqs
+
+
+```{r}
+
+
+lapply(1:length(samples_l),function(x){
+  
+  sample_subset = samples_l[[x]]
+  
+  raw = digestFastqs(
+            fastqForward = sample_subset, 
+            elementsForward = "SVSV",
+            elementLengthsForward = c(6, 22, 6, 7),
+            avePhredMinForward = 20,
+            maxNReads = -1, 
+            nThreads = 48,
+            verbose = F
+            )
+        
+        
+  save(raw, file=paste("002-digestedFastqs/no_collapse_sample_",x))
+  
+})
+
+```
+

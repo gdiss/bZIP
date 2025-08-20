@@ -1,0 +1,222 @@
+---
+title: "004 - compute dLFC"
+author: "Guillaume Diss"
+date: '2023-02-03'
+output: 
+  html_document:
+    code_folding: show
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+
+# Introduction
+
+Here, we will compute dLFC directly using limma because we can't compute them posthoc.
+
+# Load packages
+
+```{r a}
+suppressPackageStartupMessages({
+  library(parallel)
+  library(mutscan)
+  library(rgl)
+  library(stringdist)
+  library(ggplot2)
+  library(data.table)
+  library(Biostrings)
+  library(readxl)
+  library(stringr)
+})
+```
+
+
+# Data description
+
+
+
+
+# Load data
+
+```{r c}
+
+# batch composition
+batches = read.delim("000-data/TableS10_batches.txt")
+
+# load counts already aggregated per AA
+load("003-summarizedExperiment_AA.Rdata")
+
+# table of barcode variant association
+load("001-barcode_variants_association_table.Rdata")
+
+# filter out barcodes that can't be used (not correct length, promiscuous or close neighbour)
+uniq_pairs = uniq_pairs[uniq_pairs$length_bc == 22 & uniq_pairs$dist_closest_neighbour > 1 & uniq_pairs$Abc == 1,]
+
+# the id for WT has not been set correctly in the barcode-variant association script. Fix it
+uniq_pairs$id_bait[uniq_pairs$Nmut_bait == 0] = "0xx"
+uniq_pairs$id_prey[uniq_pairs$Nmut_prey == 0] = "0xx"
+uniq_pairs$std_id_bait[uniq_pairs$Nmut_bait == 0] = "x0x"
+uniq_pairs$std_id_prey[uniq_pairs$Nmut_prey == 0] = "x0x"
+
+uniq_pairs$finalBaitNt = as.character(reverseComplement(DNAStringSet(uniq_pairs$bait)))
+
+# add one or two bp from the restriction site if the nt seq length is not a mutliple of 3
+n = nchar(uniq_pairs$finalBaitNt) %% 3
+
+tmp = do.call("rbind",strsplit(uniq_pairs$va[n==2],uniq_pairs$bait[n==2]))[,1]
+r = as.character(reverseComplement(DNAStringSet(str_sub(tmp,-1,-1))))
+uniq_pairs$finalBaitNt[n==2] = paste0(uniq_pairs$finalBaitNt[n==2],r)
+
+tmp = do.call("rbind",strsplit(uniq_pairs$va[n==1],uniq_pairs$bait[n==1]))[,1]
+r = as.character(reverseComplement(DNAStringSet(str_sub(tmp,-2,-1))))
+uniq_pairs$finalBaitNt[n==1] = paste0(uniq_pairs$finalBaitNt[n==1],r)
+
+uniq_pairs$finalBaitAA = as.character(translate(DNAStringSet(uniq_pairs$finalBaitNt),no.init.codon=T))
+# I checked, all those flagged as ending with stop indeed end with a stop here as well
+
+uniq_pairs[,bait_aa:=NULL]
+
+uniq_pairs = uniq_pairs[
+    uniq_pairs$cst3 != "dubious" & 
+    !is.na(uniq_pairs$id_bait) & 
+    uniq_pairs$bait_ends_stop & 
+    !uniq_pairs$baitFlag
+    ,]
+
+
+
+ub = uniq_pairs[!duplicated(uniq_pairs$finalBaitAA),]
+seq2wtbait = ub$wt_bait
+names(seq2wtbait) = ub$finalBaitAA
+
+
+# wt AA sequence
+wt_seq = read.delim("000-data/TableS6_wt_bZIPs_aa_seq.txt")
+tmp = wt_seq$Gene
+wt_seq = wt_seq$bZIP_aa
+names(wt_seq) = tmp
+
+# wt nt sequence for preys
+wt_nt_seq = read.csv("000-data/TableS9_wt_preys_gblocks_and_barcodes.txt")
+wt_nt_seq$seq = substr(wt_nt_seq$seq,983,1500)
+str_sub(wt_nt_seq$seq,-6,-1) = ""
+wt_bar = wt_nt_seq$barcode
+names(wt_bar) = wt_nt_seq$bZIP
+tmp = wt_nt_seq$bZIP
+wt_nt_seq = wt_nt_seq$seq
+names(wt_nt_seq) = tmp
+
+
+```
+
+
+
+# Compute mutation effects as dLFC
+
+```{r d}
+dlfc = lapply(1:length(se_coll_aa), function(i){
+  
+  cat("\r",i)
+  
+  x = se_coll_aa[[i]]
+  
+  counts = SummarizedExperiment::assay(x, "counts")
+  ids = do.call("rbind",strsplit(rownames(counts),"_"))
+  ids = cbind(ids, seq2wtbait[ids[,2]])
+  
+  #keep only bait bZIP present in batch
+  k = ids[,3] %in% batches$gene[batches$batch == i]
+  counts = counts[k,]
+  ids = ids[k,]
+  
+  wt_pairs = ids[ids[,2] %in% paste0(wt_seq,"*"),]
+  
+  # need to remove pairs where wt have reads with 0 in any replicate. These would anyway be filtered out
+  wt_counts = counts[ids[,2] %in% paste0(wt_seq,"*"),]
+  w = which(rowSums(as.matrix(wt_counts) == 0) == 0)
+  wt_pairs = wt_pairs[w,]
+  
+  colData = SummarizedExperiment::colData(x)
+  
+  do.call("rbind",mclapply(1:nrow(wt_pairs),function(j){
+    
+    counts_sub = counts[ids[,1] == wt_pairs[j,1] & ids[,3] == wt_pairs[j,3],]
+    wt_row = rownames(counts)[ids[,1] == wt_pairs[j,1] & ids[,3] == wt_pairs[j,3] & ids[,2] %in% paste0(wt_seq,"*")]
+    
+    s = SummarizedExperiment::SummarizedExperiment(
+      assays = list(counts = counts_sub),
+      colData = colData, 
+      metadata = S4Vectors::metadata(x)
+    )
+    
+    xx = calculateRelativeFC(
+      se = s,
+      design = model.matrix(~ replicate + condition,
+                            data = colData),
+      WTrows = wt_row,
+      coef = "conditionoutput", pseudocount = 1, method = "limma"
+    )
+    
+    cbind(as.matrix(counts_sub), xx)
+    
+    
+  },mc.cores=48))
+  
+
+})
+
+
+```
+
+
+We need to format the data
+
+```{r e}
+
+# we first order because in case of synonymous mutation that were not expected, some features might not have been determined. So it is better that the expected one comes before its unexpected synonymous variant, so that we get the features
+uniq_pairs = uniq_pairs[order(uniq_pairs$expected_bait, decreasing = T),]
+uniq_pairs$full_id_bait = paste(uniq_pairs$wt_bait, uniq_pairs$std_id_bait, sep="_")
+
+variant_features_baits = uniq_pairs[!duplicated(uniq_pairs$finalBaitAA),c(55,29,46,45,47:49,44,43,54,6)]
+
+
+# merge read counts and LFcs
+
+dlfc2 = mclapply(1:4,function(i){
+  
+  x = dlfc[[i]]
+  
+  ids = do.call("rbind",strsplit(rownames(x),"_"))
+  tmp = match(ids[,2], variant_features_baits$finalBaitAA)
+  
+  x = data.frame(full_id_bait = variant_features_baits$full_id_bait[tmp], x)
+  names(x)[2:7] = c("i1","o1","i2","o2","i3","o3")
+  
+  x = cbind(x,variant_features_baits[tmp,2:ncol(variant_features_baits)])
+  
+  
+  x$full_id_prey = paste0(ids[,1],"_x0x")
+  x$finalPreyAA = wt_seq[ids[,1]]
+  
+  x = x[,c(1,29,2:27,30,28)]
+  
+},mc.cores=4)
+
+
+# we keep only JUN from batch 2
+dlfc2[[1]] = dlfc2[[1]][dlfc2[[1]]$wt_bait != "JUN",]
+dlfc2[[3]] = dlfc2[[3]][dlfc2[[3]]$wt_bait != "JUN",]
+dlfc2[[4]] = dlfc2[[4]][dlfc2[[4]]$wt_bait != "JUN",]
+
+dlfc = do.call("rbind",dlfc2)
+dlfc$adj.P.Val = p.adjust(dlfc$P.Value, method="fdr")
+save(dlfc,file="004-mutation_effects.Rdata")
+```
+
+We don't need to normalize batches as we did for absolute LFCs because the normalization to WT already accounts for batch effects in principle
+
+
+
