@@ -1,0 +1,2 @@
+phenotype	transformation	trait	file
+Binding	TwoStateFractionFolded	Binding	001-Mochi_input.RData
