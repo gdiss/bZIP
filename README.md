@@ -3,41 +3,25 @@ This repository contains all the code used to reproduce the analyses an results 
 
 Requirements:
 R version 4.6.0 (2026-04-24)
-
 MoCHI 1.1
-
 
 R packages:
 
-parallel 4.6.0
-
-ggplot2 4.0.3
-
-rgl 1.3.36
-
-stringdist 0.9.17
-
-mutscan 1.2.0
-
-Biostrings 2.80.2
-
-stringr 1.6.0
-
-data.table 1.18.6.1
-
-readxl 1.6.0
-
-ShortRead 1.70.0
-
-dplyr 1.2.1
-
-cowplot 1.2.0
-
-gridExtra 2.3.1
-
-ggh4x 0.3.1
-
-gplots 3.3.0
+parallel 4.6.0  
+ggplot2 4.0.3  
+rgl 1.3.36  
+stringdist 0.9.17  
+mutscan 1.2.0  
+Biostrings 2.80.2  
+stringr 1.6.0  
+data.table 1.18.6.1  
+readxl 1.6.0  
+ShortRead 1.70.0  
+dplyr 1.2.1  
+cowplot 1.2.0  
+gridExtra 2.3.1  
+ggh4x 0.3.1  
+gplots 3.3.0  
 
 
 1) Put all fastq files from the GEO repository in the 000-data folder
