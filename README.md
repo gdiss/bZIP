@@ -26,8 +26,8 @@ gplots 3.3.0
 1) Put all fastq files from the GEO repository in the 000-data folder
 2) Put the binder_optimization.csv file from the github repository of the deep learning models in the 000-data folder
 3) Put Table S4 to S12 (except S5) from the supplementary method in the 00-data folder
-4) install mutscan from within R (devtools::install_github("fmicompbio/mutscan"))
-5) install MoCHI (https://github.com/lehner-lab/MoCHI)
+4) install mutscan from within R (devtools::install_github("fmicompbio/mutscan")) (installation time ~ a few minutes)
+5) install MoCHI (https://github.com/lehner-lab/MoCHI) (installation time ~ a few minutes)
 6) run 001-bar_var_assoc_bZIP_screen.Rmd
 7) run 002-digestFastq.Rmd
 8) run 003-binding_scores.Rmd
