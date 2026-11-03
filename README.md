@@ -1,7 +1,7 @@
 # bZIP
 This repository contains all the code used to reproduce the analyses an results presented in "The genetic architecture of the human bZIP interaction network" by Bendel et al., except the code regarding the deep learning models (which can be found at https://github.com/fmi-basel/Deep-learning-bZIPs)
 
-Requirements:
+Requirements:  
 R version 4.6.0 (2026-04-24)  
 MoCHI 1.1  
 
